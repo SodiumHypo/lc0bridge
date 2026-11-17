@@ -27,6 +27,7 @@ function broadcast(payload) {
 
 let engineGen = 0;
 let restartAttempts = 0;
+let restartTimer = null;
 let shuttingDown = false;
 let ownsEngine = false;
 const MAX_RESTARTS = 5;
@@ -51,6 +52,9 @@ function startEngine() {
     { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true }
   );
   ownsEngine = true;
+  // Writing to a dying engine's stdin raises an async EPIPE; without a listener
+  // that uncaught 'error' would kill the whole backend (and orphan the container).
+  engine.stdin.on('error', () => {});
   // A fresh process knows nothing about UCI yet; clients must re-handshake.
   broadcast({ type: 'reset' });
 
@@ -197,7 +201,9 @@ wss.on('connection', (ws) => {
         engine = null;
       }
       engineReady = false;
-      setTimeout(startEngine, 300);
+      // Coalesce rapid consecutive 'restart' messages into a single relaunch.
+      clearTimeout(restartTimer);
+      restartTimer = setTimeout(startEngine, 300);
     }
   });
 });

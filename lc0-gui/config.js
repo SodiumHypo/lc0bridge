@@ -7,16 +7,19 @@
 const fs = require('fs');
 const path = require('path');
 
+// Defaults are machine-neutral placeholders. Copy config.example.json to
+// config.json (git-ignored) and fill in this machine's WSL distro, mount and
+// network file; every key you omit falls back to the values below.
 const DEFAULTS = {
   // server.js: WSL2/Docker engine backend.
   engine: {
-    distro: 'Ubuntu-26.10',
+    distro: 'Ubuntu',
     image: 'nvidia/cuda:12.8.0-cudnn-devel-ubuntu22.04',
-    hostMount: '/home/sodiumhypo/lc0-deploy',
+    hostMount: '/home/YOUR_USER/lc0-deploy',
     containerName: 'lc0-uci',
     binary: '/work/bin/lc0',
     weightsDir: '/work/weights',
-    weightsFile: 'BT4-1024x15x32h-swa-6147500-policytune-332.pb.gz',
+    weightsFile: 'network.pb.gz',
     backend: 'cuda-fp16',
     port: 8642,
   },
@@ -37,6 +40,18 @@ const DEFAULTS = {
     retryGapMs: 400,         // pause before a retry (let the user's mouse settle)
     debugPort: 0,            // >0: fixed Chrome debugging port instead of the port file
     daemonCli: 'chrome-auto-connect-win',
+    // Auto-start: create games and chain to the next one without manual clicks.
+    autoStart: false,        // master switch (false = takeover-only, the historical behavior)
+    autoMode: '5+3',         // homepage pool data-id ("1+0".."30+20") or "ai"
+    aiLevel: 8,              // AI strength 1-8 (autoMode "ai")
+    aiColor: 'random',       // white | black | random (autoMode "ai")
+    aiTime: 'unlimited',     // unlimited | realtime (autoMode "ai")
+    aiPreset: '5+3',         // realtime time-control preset "M+I" (aiTime "realtime")
+    nextGameDelayMs: 4000,   // cooldown after a game ends before seeking the next
+    seekTimeoutMs: 120000,   // cancel an unmatched pool seek after this (0 = never)
+    whiteFirstMove: 'd2d4',  // opening book: White's move 1 (queen's pawn two squares, 1.d4); "" = engine decides
+    stopKey: 's',            // console hotkey: finish the current game, then exit without starting a new one
+    claimVictory: true,      // auto-click "claim victory" when the opponent abandons (ends the game, chains on)
   },
 };
 

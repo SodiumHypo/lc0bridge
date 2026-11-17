@@ -1,0 +1,7 @@
+# Normalize line endings for cross-platform pushes; Windows batch needs CRLF.
+* text=auto eol=lf
+*.cmd text eol=crlf
+*.bat text eol=crlf
+*.png binary
+*.jpg binary
+*.gz binary

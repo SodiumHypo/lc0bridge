@@ -1,12 +1,12 @@
 {
   "engine": {
-    "distro": "Ubuntu-26.10",
+    "distro": "Ubuntu",
     "image": "nvidia/cuda:12.8.0-cudnn-devel-ubuntu22.04",
-    "hostMount": "/home/sodiumhypo/lc0-deploy",
+    "hostMount": "/home/YOUR_USER/lc0-deploy",
     "containerName": "lc0-uci",
     "binary": "/work/bin/lc0",
     "weightsDir": "/work/weights",
-    "weightsFile": "BT4-1024x15x32h-swa-6147500-policytune-332.pb.gz",
+    "weightsFile": "network.pb.gz",
     "backend": "cuda-fp16",
     "port": 8642
   },
@@ -25,6 +25,17 @@
     "moveAttempts": 3,
     "retryGapMs": 400,
     "debugPort": 0,
-    "daemonCli": "chrome-auto-connect-win"
+    "daemonCli": "chrome-auto-connect-win",
+    "autoStart": false,
+    "autoMode": "5+3",
+    "aiLevel": 8,
+    "aiColor": "random",
+    "aiTime": "unlimited",
+    "aiPreset": "5+3",
+    "nextGameDelayMs": 4000,
+    "seekTimeoutMs": 120000,
+    "whiteFirstMove": "d2d4",
+    "stopKey": "s",
+    "claimVictory": true
   }
 }

@@ -4,6 +4,9 @@ node_modules/
 # Local Chrome test profile (cookies / login data - never commit)
 .chrome-test/
 
+# Machine-specific config: copy lc0-gui/config.example.json -> config.json
+lc0-gui/config.json
+
 # Logs & OS junk
 *.log
 Thumbs.db

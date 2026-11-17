@@ -13,9 +13,12 @@
  * lichess fair-play policy (risk of account closure); BOT-flagged accounts are
  * the sanctioned option. The bridge still takes over human games by design.
  *
- * It only TAKES OVER an already-started game once the board is laid out. It
- * never starts games, never clicks rematch/resign/draw or any other UI button -
- * the only page elements it clicks are board squares and promotion pieces.
+ * By default it only TAKES OVER an already-started game once the board is laid
+ * out. With bridge.autoStart enabled in config.json it also CREATES games
+ * (homepage quick-pairing pools or the AI dialog) and chains to the next one
+ * after each finish. It never resigns, rematches, or offers draws; page clicks
+ * are limited to board squares, promotion pieces, and (when auto-starting) the
+ * homepage pool/AI setup controls.
  *
  *   lichess.org (Chrome tab)
  *         ^  CDP trusted input / DOM snapshots
@@ -50,9 +53,12 @@ for (let i = 2; i < process.argv.length; i++) {
     if (p > 0) CONFIG.debugPort = p;
   } else if (process.argv[i] === '--help' || process.argv[i] === '-h') {
     console.log('Usage: node lichess-bridge.js [--movetime <ms>] [--debug-port <port>]');
-    console.log('Manually start a lichess game in Chrome first (computer, human, or BOT account); the bridge takes over our moves once the board is laid out.');
-    console.log('Spectator views and finished games are not taken over. Note: engine use in human games on normal accounts violates lichess fair-play rules (use at your own risk).');
+    console.log('Takeover: start a lichess game in Chrome (computer, human, or BOT); the bridge plays our moves once the board is laid out.');
+    console.log('Auto-start: set bridge.autoStart=true and bridge.autoMode in config.json ("ai" or a homepage pool id like "5+3"); the bridge creates games and chains to the next after each finish.');
+    console.log('Spectator views and finished games are not taken over. Note: engine use in online human games on normal accounts violates lichess fair-play rules (BOT accounts are sanctioned).');
     console.log('--debug-port <port>: connect to Chrome on a fixed remote-debugging port (e.g. 9222) instead of the DevToolsActivePort file; handy for self-test.');
+    console.log(`Stop: press "${CONFIG.stopKey}" in this console to finish the current game then exit without starting a new one (Ctrl+C = immediate). Config: bridge.stopKey.`);
+    console.log('chrome-auto-connect-win is optional; without it, click "Allow" on Chrome\'s remote-debugging dialog manually.');
     process.exit(0);
   }
 }
@@ -68,6 +74,7 @@ function logThrottled(key, ms, ...args) {
 
 // Lichess game ids are 8 chars on older games and 12 chars on newer ones.
 const GAME_URL_RE = /^https?:\/\/(?:www\.)?lichess\.org\/(?:game\/)?([A-Za-z0-9]{8,12})(?:[/?#]|$)/;
+const HOME_URL_RE = /^https?:\/\/(?:www\.)?lichess\.org\/?($|\?|#)/;
 const ROLE_CODE = { pawn: 'P', knight: 'N', bishop: 'B', rook: 'R', queen: 'Q', king: 'K' };
 const PROMO_ROLE = { q: 'queen', n: 'knight', r: 'rook', b: 'bishop' };
 
@@ -201,6 +208,9 @@ function pageSnapshot() {
   // End of game: client-rendered result banner, server-rendered meta status,
   // or the rematch controls.
   const finished = !!q('.result-wrap p.status, .game__meta .status, button.rematch, .fbt.rematch, .rematch-decline');
+  // Opponent abandoned: lichess offers a green "claim victory" button (the draw
+  // claim is a plain button, rematch is .fbt.rematch, so green = victory claim).
+  const claimVictory = !!q('.round__app .button-green, main.round .button-green');
 
   const promo = q('#promotion-choice');
   return {
@@ -217,9 +227,15 @@ function pageSnapshot() {
     initialFen: pd && pd.game && pd.game.initialFen ? pd.game.initialFen : null,
     clockRunning,
     ourClockSec: ourClock ? ourClock.clockSec : null,
-    // Untimed games have no clocks; moves>0 also implies a live game.
-    started: clockRunning || clocks.length === 0 || sans.length > 0,
+    // Untimed games have no clocks; moves>0 also implies a live game. In online
+    // HUMAN games the clock only starts AFTER the first move (lichess shows a
+    // "make your first move" countdown instead), so at ply 0 clockRunning is
+    // false by design. The resign button only exists once the game is live (a
+    // waiting-for-opponent page offers Cancel, not resign), so it marks a
+    // started game even before the clock ticks.
+    started: clockRunning || clocks.length === 0 || sans.length > 0 || !!q('.fbt.resign'),
     finished,
+    claimVictory,
     sans,
     pieces,
     animating,
@@ -250,6 +266,54 @@ function pagePromoPos(role, color) {
     }
   }
   return null;
+}
+
+// Homepage lobby state. Anchors are locale-independent: pool buttons are
+// div.lpool[data-id="5+3"] (the clock notation is universal), the AI entry is
+// .lobby__start__button--ai. A pending quick-pairing seek marks its pool
+// `.lpool.active` and shows a spinner; the URL stays on the homepage until an
+// opponent is found, then lichess navigates the same tab to /<gameId>.
+function pageLobby() {
+  const q = (s) => document.querySelector(s);
+  const url = location.href;
+  const pools = Array.from(document.querySelectorAll('.lpool[data-id]')).map((p) => ({
+    id: p.getAttribute('data-id'),
+    active: p.classList.contains('active'),
+  }));
+  const ai = q('.lobby__start__button--ai');
+  const r = ai ? ai.getBoundingClientRect() : null;
+  return {
+    url,
+    isHome: /lichess\.org\/?($|\?|#)/.test(url) && !!q('main.lobby'),
+    user: (document.body && document.body.getAttribute('data-user')) || null,
+    pools,
+    seeking: pools.some((p) => p.active),
+    aiButton: r && r.width > 0 ? { x: r.x + r.width / 2, y: r.y + r.height / 2 } : null,
+    dialogOpen: !!q('.game-setup'),
+  };
+}
+
+// Click a lobby/setup element synthetically (scrolling it into view first).
+// Unlike the board (chessground needs trusted CDP mouse input), lichess lobby
+// and dialog buttons use plain DOM click handlers, so a synthetic el.click()
+// works AND is immune to the Chrome window being occluded/background - trusted
+// mouse clicks on a background window silently no-op for form submits.
+// spec: {sel} CSS selector | {tab:N} Nth AI time-control tab (0 unlimited,
+// 1 realtime, 2 correspondence) | {preset:"M+I"} AI realtime preset button |
+// {radio:"sf_level_8"|"color-picker-white"} AI setup radio input id |
+// {lobbyTab:N} Nth homepage lobby tab (0 quick pairing, 1 lobby, 2 correspondence,
+// 3 ongoing) - lichess remembers the last lobby tab across visits.
+function pageClick(spec) {
+  let el = null;
+  if (spec.sel) el = document.querySelector(spec.sel);
+  else if (spec.tab != null) el = document.querySelectorAll('.game-setup .time-control-tabs .tabs-horiz button[role=tab]')[spec.tab];
+  else if (spec.preset != null) el = Array.from(document.querySelectorAll('.game-setup .preset-btn')).find((b) => (b.textContent || '').trim() === spec.preset);
+  else if (spec.radio) el = document.getElementById(spec.radio);
+  else if (spec.lobbyTab != null) el = document.querySelectorAll('.lobby__app .tabs-horiz button')[spec.lobbyTab];
+  if (!el) return false;
+  el.scrollIntoView({ block: 'center', inline: 'center' });
+  el.click();
+  return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -296,7 +360,9 @@ class CdpClient {
     const { wsEndpoint } = await resolveEndpoint();
     const ws = new WebSocket(wsEndpoint);
     await new Promise((res, rej) => {
-      const t = setTimeout(() => rej(new Error('CDP connection timeout (check the "Allow remote debugging" dialog)')), 20000);
+      const t = setTimeout(() => rej(new Error('CDP connection timeout. ' + (daemonAvailable === false
+        ? 'Click "Allow" on Chrome\'s "Allow remote debugging?" dialog MANUALLY.'
+        : 'Check the "Allow remote debugging" dialog (chrome-auto-connect-win should click it for you).'))), 20000);
       ws.once('open', () => { clearTimeout(t); res(); });
       ws.once('error', (e) => { clearTimeout(t); rej(e); });
     });
@@ -343,6 +409,13 @@ class CdpClient {
     return sessionId;
   }
 
+  // Release a debugger session. Without this, re-attaching the same tab every
+  // game cycle accumulates sessions in Chrome over hours of continuous play.
+  detach(sessionId) {
+    if (!sessionId || !this.connected) return Promise.resolve();
+    return this.send('Target.detachFromTarget', { sessionId }).catch(() => {});
+  }
+
   async evaluate(sessionId, expression) {
     const r = await this.send('Runtime.evaluate', { expression, returnByValue: true, awaitPromise: true }, sessionId);
     if (r.exceptionDetails) {
@@ -359,21 +432,43 @@ class CdpClient {
     await this.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button: 'left', buttons: 0, clickCount: 1 }, sessionId);
   }
 
+  navigate(sessionId, url) { return this.send('Page.navigate', { url }, sessionId); }
+
+  async createTarget(url) {
+    const { targetId } = await this.send('Target.createTarget', { url });
+    return targetId;
+  }
+
   close() { try { this.ws && this.ws.close(); } catch { /* already closed */ } this.connected = false; }
 }
 
 // Best-effort: keep the chrome-auto-connect-win watcher running so Chrome's
-// "Allow remote debugging?" dialog is clicked automatically.
+// "Allow remote debugging?" dialog is clicked automatically. The package is
+// OPTIONAL: without it the bridge still works, but the user must click "Allow"
+// on Chrome's dialog by hand, so say that clearly instead of failing silently.
+let daemonAvailable = null; // null = not probed yet, true/false afterwards
 function ensureDaemon() {
+  if (daemonAvailable === false) return; // known missing; prompt already shown
+  const manualHint = 'chrome-auto-connect-win is not available: when Chrome shows the "Allow remote debugging?" dialog, click "Allow" MANUALLY (or install it with: npm i -g chrome-auto-connect-win).';
   try {
     // Single command string (constant args) avoids the shell+args deprecation.
     const r = spawnSync(`${CONFIG.daemonCli} status --json --no-page-check`, { shell: true, encoding: 'utf8', timeout: 20000, windowsHide: true });
-    const status = JSON.parse(r.stdout || '{}');
+    let status = null;
+    try { status = JSON.parse(r.stdout || ''); } catch { status = null; }
+    // With shell:true a missing command does NOT throw: it returns a non-zero
+    // status / empty stdout. Treat that as "package absent", not "daemon idle".
+    if (r.error || r.status !== 0 || !status) {
+      daemonAvailable = false;
+      log(manualHint);
+      return;
+    }
+    daemonAvailable = true;
     if (status.daemon && status.daemon.running) return;
     spawn(`${CONFIG.daemonCli} start --no-connect`, { shell: true, detached: true, stdio: 'ignore', windowsHide: true }).unref();
     log('Started chrome-auto-connect-win daemon (auto-clicks the remote-debugging confirmation dialog)');
   } catch (e) {
-    log('Note: cannot manage chrome-auto-connect-win automatically (' + e.message + '). If Chrome shows "Allow remote debugging", click Allow manually.');
+    daemonAvailable = false;
+    log(manualHint + ' (' + e.message + ')');
   }
 }
 
@@ -425,6 +520,11 @@ class PageAgent {
     await this.cdp.click(this.sid, pos.x, pos.y);
     return true;
   }
+
+  lobby() { return this.cdp.evaluate(this.sid, `(${pageLobby.toString()})()`); }
+
+  // Synthetic click on a lobby/setup element resolved by pageClick(spec).
+  clickSpec(spec) { return this.cdp.evaluate(this.sid, `(${pageClick.toString()})(${JSON.stringify(spec)})`); }
 }
 
 // ---------------------------------------------------------------------------
@@ -481,6 +581,10 @@ class EngineClient {
     this.ws = ws;
     ws.on('open', () => {
       log('Connected to engine bridge ' + this.url + ', starting UCI handshake');
+      // A reconnect re-handshakes but does NOT emit 'reset'; without clearing
+      // this flag a stale watchdog 'ignoreBestmove' would swallow every future
+      // bestmove (each search then times out forever).
+      this.ignoreBestmove = false;
       this._send('uci');
     });
     ws.on('message', (raw) => {
@@ -611,6 +715,27 @@ function piecesMatch(chess, pieces) {
   return ek.every((k) => pieces[k] === expected[k]);
 }
 
+// Quick-pairing pool ids shown on the lichess homepage (data-id attribute).
+// "custom" opens a manual setup dialog, so it is not auto-startable.
+const POOL_IDS = new Set(['1+0', '2+1', '3+0', '3+2', '5+0', '5+3', '10+0', '10+5', '15+10', '30+0', '30+20']);
+
+// Resolve the auto-start configuration into a concrete mode, or null when
+// auto-start is off / the mode is invalid (the bridge then stays takeover-only).
+function resolveAutoMode(cfg) {
+  if (!cfg.autoStart) return null;
+  const m = String(cfg.autoMode || '').trim().toLowerCase();
+  if (m === 'ai' || m === 'computer') {
+    const lv = parseInt(cfg.aiLevel, 10);
+    const level = Math.max(1, Math.min(8, Number.isFinite(lv) ? lv : 8));
+    const color = ['white', 'black', 'random'].includes(cfg.aiColor) ? cfg.aiColor : 'random';
+    const time = cfg.aiTime === 'realtime' ? 'realtime' : 'unlimited';
+    const preset = /^\d+\+\d+$/.test(String(cfg.aiPreset || '')) ? String(cfg.aiPreset) : '5+3';
+    return { kind: 'ai', level, color, time, preset };
+  }
+  if (POOL_IDS.has(m)) return { kind: 'pool', id: m };
+  return null;
+}
+
 class Controller {
   constructor(engine) {
     this.engine = engine;
@@ -625,6 +750,20 @@ class Controller {
     this.frontedGame = null;
     this.evalChain = null;          // { win, ply, gameId } of our previous search
     this.oppAcc = { sum: 0, n: 0 }; // running opponent-accuracy estimate
+    // Auto-start state machine: idle -> seeking -> (game taken over) -> cooldown -> idle
+    this.autoMode = resolveAutoMode(CONFIG);
+    this.autoPhase = 'idle';
+    this.autoSeekAt = 0;            // when the current seek/setup was initiated
+    this.autoNextAt = 0;            // cooldown deadline after a finished game
+    this.autoBusy = false;          // re-entrancy guard for the start subroutine
+    this.autoFails = 0;             // consecutive failed starts; circuit breaker at 4
+    this.stopRequested = false;     // stop hotkey: finish current game, then exit
+    this.gameInProgress = false;    // a live takeover game still being played
+    this.badTabs = new Map();       // targetId -> url of tabs that are not playable rounds
+    this.roundPending = new Map();  // targetId -> first-seen ts of a not-yet-loaded round
+    this.lobbyTargetId = null;
+    this.lobbySid = null;
+    this.lobbyAgent = null;
   }
 
   warnOnce(key, ...args) {
@@ -679,42 +818,228 @@ class Controller {
     this.targetId = null;
     this.sid = null;
     this.agent = null;
+    this.lobbyTargetId = null;
+    this.lobbySid = null;
+    this.lobbyAgent = null;
     log('CDP connected');
   }
 
   // Chrome pauses requestAnimationFrame for hidden/occluded pages, which
   // freezes chessground move animations and leaves piece transforms stale.
   // Focus emulation keeps the page rendering regardless of window visibility.
-  async keepRendering() {
-    if (!this.cdp || !this.sid) return;
-    await this.cdp.send('Emulation.setFocusEmulationEnabled', { enabled: true }, this.sid).catch(() => {});
-    await this.cdp.send('Page.setWebLifecycleState', { state: 'active' }, this.sid).catch(() => {});
+  async keepRendering(sid = this.sid) {
+    if (!this.cdp || !sid) return;
+    await this.cdp.send('Emulation.setFocusEmulationEnabled', { enabled: true }, sid).catch(() => {});
+    await this.cdp.send('Page.setWebLifecycleState', { state: 'active' }, sid).catch(() => {});
+  }
+
+  // ---- Auto-start: create the next game once the current one is over ----
+
+  scheduleNext() {
+    if (!this.autoMode || this.autoPhase === 'cooldown' || this.stopRequested) return;
+    this.autoPhase = 'cooldown';
+    this.autoNextAt = Date.now() + CONFIG.nextGameDelayMs;
+    const label = this.autoMode.kind === 'ai' ? `AI level ${this.autoMode.level}` : this.autoMode.id;
+    log(`Game over; next (${label}) in ${Math.round(CONFIG.nextGameDelayMs / 1000)}s`);
+  }
+
+  // Shared auto-start failure counter (seek timeouts AND missing UI elements)
+  // so every failure mode feeds the same circuit breaker.
+  noteAutoFail(msg) {
+    this.autoFails++;
+    if (this.autoFails >= 4) {
+      this.autoMode = null;
+      log('⚠ Auto-start DISABLED after 4 failed attempts: ' + msg + '. Check the page/Chrome, then restart the bridge.');
+    } else {
+      logThrottled('auto-fail', 5000, `${msg} (${this.autoFails}/4)`);
+    }
+  }
+
+  // Stop hotkey: no new games; finish any live takeover game, then exit.
+  requestStop() {
+    if (this.stopRequested) return;
+    this.stopRequested = true;
+    log(this.gameInProgress
+      ? `Stop key "${CONFIG.stopKey}" pressed: finishing the current game, then exiting (no new games).`
+      : `Stop key "${CONFIG.stopKey}" pressed: no active game, exiting.`);
+  }
+
+  // Called when no game tab exists: drive a homepage tab to create a game.
+  async autoStartStep(allTabs) {
+    if (!this.autoMode || this.autoBusy || this.stopRequested) return;
+    if (this.autoPhase === 'cooldown' && Date.now() < this.autoNextAt) return;
+    if (!this.engine.ready) { logThrottled('auto-engine-wait', 10000, 'Auto-start waiting for the engine to be ready…'); return; }
+    this.autoBusy = true;
+    try {
+      // Only reuse a tab already on the homepage; never hijack the user's own
+      // study/puzzle/forum tab by navigating it away.
+      let tab = allTabs.find((t) => HOME_URL_RE.test(t.url));
+      if (!tab) {
+        const targetId = await this.cdp.createTarget('https://lichess.org/');
+        tab = { targetId, url: 'https://lichess.org/' };
+        await sleep(2500); // let the homepage load
+      }
+      if (tab.targetId !== this.lobbyTargetId || !this.lobbyAgent) {
+        await this.cdp.detach(this.lobbySid);
+        this.lobbyTargetId = tab.targetId;
+        this.lobbySid = await this.cdp.attach(tab.targetId);
+        this.lobbyAgent = new PageAgent(this.cdp, this.lobbySid);
+        await this.keepRendering(this.lobbySid);
+      }
+      // CDP mouse input on a background tab is unreliable (the AI submit would
+      // silently no-op); focus the lobby tab before driving it.
+      await this.cdp.send('Page.bringToFront', {}, this.lobbySid).catch(() => {});
+      const lobby = await this.lobbyAgent.lobby();
+      // A game already lives in this tab (we just created it, or the user did).
+      // NEVER navigate away from a live game: doing so mid-seek abandoned each
+      // created game and the retry spawned another (the runaway). Just reset to
+      // idle and let the main game-tab filter pick it up on the next poll.
+      if (GAME_URL_RE.test(lobby.url)) {
+        this.autoPhase = 'idle'; this.autoSeekAt = 0; this.autoFails = 0;
+        return;
+      }
+      if (!lobby.isHome) {
+        if (this.autoPhase === 'seeking') { this.autoPhase = 'idle'; return; }
+        await this.cdp.navigate(this.lobbySid, 'https://lichess.org/');
+        await sleep(2000);
+        return;
+      }
+      // Already submitted: wait for the game tab. On timeout, reload a clean
+      // homepage (clears any stuck dialog) before retrying - never re-submit
+      // onto a possibly-pending dialog. A circuit breaker stops runaway creation.
+      if (this.autoPhase === 'seeking') {
+        const limit = this.autoMode.kind === 'ai' ? 30000 : CONFIG.seekTimeoutMs;
+        if (limit > 0 && Date.now() - this.autoSeekAt > limit) {
+          // Re-read: a match may have landed between the snapshot and now;
+          // never cancel/navigate away a live game (runaway race window).
+          const fresh = await this.lobbyAgent.lobby();
+          if (GAME_URL_RE.test(fresh.url)) { this.autoPhase = 'idle'; this.autoSeekAt = 0; this.autoFails = 0; return; }
+          if (this.autoMode.kind === 'pool' && fresh.seeking) await this.lobbyAgent.clickSpec({ sel: '.lpool.active' });
+          await this.cdp.navigate(this.lobbySid, 'https://lichess.org/').catch(() => {});
+          this.autoPhase = 'idle';
+          this.autoFails++;
+          if (this.autoFails >= 4) {
+            this.autoMode = null;
+            log('⚠ Auto-start DISABLED after 4 failed attempts (games created but not detected). Check Chrome focus/page, then restart the bridge.');
+          } else {
+            log(`Auto-start timed out (${this.autoFails}/4), reloaded homepage to retry`);
+          }
+        }
+        return;
+      }
+      if (this.autoMode.kind === 'pool') await this.seekPool(lobby);
+      else await this.startAi(lobby);
+    } catch (e) {
+      logThrottled('auto-err', 5000, 'Auto-start error: ' + e.message);
+      await this.cdp.detach(this.lobbySid);
+      this.lobbyTargetId = null; this.lobbySid = null; this.lobbyAgent = null;
+    } finally {
+      this.autoBusy = false;
+    }
+  }
+
+  async seekPool(lobby) {
+    const id = this.autoMode.id;
+    if (lobby.seeking) { this.autoPhase = 'seeking'; this.autoSeekAt = Date.now(); return; }
+    const poolSel = { sel: `.lpool[data-id=${JSON.stringify(id)}]` };
+    let ok = await this.lobbyAgent.clickSpec(poolSel);
+    if (!ok) {
+      // lichess restores the last lobby tab (e.g. "ongoing games"), which hides
+      // the quick-pairing pools. Switch back to quick pairing (tab 0) and retry.
+      await this.lobbyAgent.clickSpec({ lobbyTab: 0 });
+      await sleep(600);
+      ok = await this.lobbyAgent.clickSpec(poolSel);
+    }
+    if (!ok) { this.noteAutoFail(`Pool "${id}" not on the homepage (rating/locale filter?)`); return; }
+    this.autoPhase = 'seeking';
+    this.autoSeekAt = Date.now();
+    log(`Auto-seek ${id} (waiting for an opponent)…`);
+  }
+
+  async startAi(lobby) {
+    const m = this.autoMode;
+    const a = this.lobbyAgent;
+    if (!lobby.dialogOpen) {
+      if (!lobby.aiButton) { this.noteAutoFail('AI entry button not found on the homepage'); return; }
+      await a.clickSpec({ sel: '.lobby__start__button--ai' });
+      await sleep(800);
+    }
+    await a.clickSpec({ tab: m.time === 'realtime' ? 1 : 0 }); // 0 unlimited, 1 realtime
+    await sleep(300);
+    if (m.time === 'realtime') { await a.clickSpec({ preset: m.preset }); await sleep(200); }
+    await a.clickSpec({ radio: 'sf_level_' + m.level });
+    await sleep(150);
+    await a.clickSpec({ radio: 'color-picker-' + m.color });
+    await sleep(150);
+    const ok = await a.clickSpec({ sel: '.game-setup .lobby__start__button--ai' });
+    if (!ok) { this.noteAutoFail('AI submit button not found'); return; }
+    this.autoPhase = 'seeking';
+    this.autoSeekAt = Date.now();
+    log(`Auto-start AI game (level ${m.level}, ${m.color}, ${m.time}${m.time === 'realtime' ? ' ' + m.preset : ''})…`);
   }
 
   async tick() {
     await this.ensureCdp();
     const allTabs = await this.cdp.pages();
     const tabs = allTabs.filter((p) => GAME_URL_RE.test(p.url));
-    if (!tabs.length) {
+    // GAME_URL_RE also matches /analysis, /training, 8-12-char usernames, etc.
+    // Skip tabs already proven non-rounds (re-probe if their URL changed).
+    const usable = tabs.filter((t) => !(this.badTabs.has(t.targetId) && this.badTabs.get(t.targetId) === t.url));
+    if (!usable.length) {
+      await this.cdp.detach(this.sid);
       this.targetId = null; this.sid = null; this.agent = null; this.gameId = null;
+      this.gameInProgress = false;
+      if (this.stopRequested) {
+        // Don't leave a dangling pool seek behind when stopping.
+        if (this.autoPhase === 'seeking' && this.autoMode && this.autoMode.kind === 'pool' && this.lobbyAgent) {
+          await this.lobbyAgent.clickSpec({ sel: '.lpool.active' }).catch(() => {});
+        }
+        return; // run loop sees stopRequested + no active game and exits
+      }
+      if (this.autoMode) { await this.autoStartStep(allTabs); return; }
       const seen = allTabs.slice(0, 6).map((p) => p.url).join(' | ') || 'none';
-      logThrottled('no-tab', 10000, `Waiting for a lichess game tab… (start a game manually in Chrome; the bridge takes over but never starts games) current tabs: ${seen}`);
+      logThrottled('no-tab', 10000, `Waiting for a lichess game tab… (start a game manually in Chrome, or set bridge.autoStart in config.json) current tabs: ${seen}`);
       return;
     }
-    const tab = tabs.find((t) => t.targetId === this.targetId) || tabs[0];
+    const tab = usable.find((t) => t.targetId === this.targetId) || usable[0];
     if (tab.targetId !== this.targetId) {
+      await this.cdp.detach(this.sid);
       this.targetId = tab.targetId;
       this.sid = await this.cdp.attach(tab.targetId);
       this.agent = new PageAgent(this.cdp, this.sid);
       this.gameId = null;
       await this.keepRendering();
+      // Focus the game tab BEFORE the started/turn gates: a background tab
+      // stalls lichess's clock and animations, so `started` reads false at
+      // ply 0 and the first move (opening book) would never fire.
+      await this.cdp.send('Page.bringToFront', {}, this.sid).catch(() => {});
       log('Attached game tab: ' + tab.url);
     }
 
     const snap = await this.agent.snapshot();
 
-  // -- 1. Board-ready gate --
-  if (!snap.isRound || !snap.boardReady) {
+  // -- 1. Playable-round gate (with load grace) --
+  // A freshly-created game tab is briefly !isRound / !isPlayer while the round
+  // app and player identity load; blacklisting instantly would discard a good
+  // game and spawn another. Only blacklist a tab that stays non-playable for a
+  // grace period (analysis/puzzle/profile/spectator pages never become ours).
+  if (!snap.isRound || !snap.isPlayer) {
+    const now = Date.now();
+    const since = this.roundPending.get(this.targetId);
+    if (since == null) this.roundPending.set(this.targetId, now);
+    if (since == null || now - since < 5000) {
+      logThrottled('no-board', 5000, 'Board/players not ready yet, waiting…');
+      return;
+    }
+    this.roundPending.delete(this.targetId);
+    this.badTabs.set(this.targetId, snap.url);
+    await this.cdp.detach(this.sid);
+    this.targetId = null; this.sid = null; this.agent = null;
+    logThrottled('not-round', 5000, snap.isRound ? 'Spectator view, not taking over' : 'Tab is not a playable game round, skipping it');
+    return;
+  }
+  this.roundPending.delete(this.targetId);
+  if (!snap.boardReady) {
     logThrottled('no-board', 5000, 'Board not laid out yet, waiting…');
     return;
   }
@@ -725,6 +1050,9 @@ class Controller {
     this.warned.clear();
     this.evalChain = null;
     this.oppAcc = { sum: 0, n: 0 };
+    this.autoPhase = 'idle'; // a game appeared: any pending seek resolved
+    this.autoSeekAt = 0;
+    this.autoFails = 0;
 
     const spectator     = !snap.isPlayer;
     const humanVsHuman  = !snap.opponentIsAi && !snap.ourIsBot; // online human game
@@ -733,6 +1061,7 @@ class Controller {
     //   Human games are no longer excluded; they take the same entry as bot games
     this.takeover     = !spectator && !alreadyDone;
     this.isHumanGame  = humanVsHuman;
+    this.gameInProgress = this.takeover && !snap.finished;
 
     const mode = snap.opponentIsAi ? 'vs computer'
                : snap.ourIsBot     ? 'BOT-account online'
@@ -746,18 +1075,33 @@ class Controller {
     }
   }
 
-  // -- 3. Fast skip conditions --
-  if (this.doneGames.has(this.gameId)) return;
-
-  if (snap.finished) {
-    log(`Game ${this.gameId} finished, releasing takeover (waiting for the next manually started game)`);
-    this.doneGames.add(this.gameId);
-    this.takeover = false;
+  // Opponent abandoned: claim the win so the game ends and the chain continues
+  // (otherwise it hangs until our own clock flags). Green button = victory claim.
+  if (CONFIG.claimVictory && this.takeover && snap.claimVictory && !snap.finished) {
+    const ok = await this.agent.clickSpec({ sel: '.round__app .button-green, main.round .button-green' });
+    if (ok) logThrottled('claim', 3000, 'Opponent left the game; claiming victory');
     return;
   }
 
-  if (!snap.isPlayer) {
-    this.warnOnce('spectator', 'Spectator view, not taking over');
+  // -- 3. Fast skip conditions --
+  // Auto-start: once a finished game's cooldown elapses, reuse its tab to go
+  // back to the homepage; the next poll (no game tab) creates the next game.
+  if (this.autoMode && !this.stopRequested && this.autoPhase === 'cooldown' && Date.now() >= this.autoNextAt && (snap.finished || this.doneGames.has(this.gameId))) {
+    log('Loading the next game…');
+    await this.cdp.navigate(this.sid, 'https://lichess.org/').catch(() => {});
+    await this.cdp.detach(this.sid);
+    this.targetId = null; this.sid = null; this.agent = null; this.gameId = null;
+    this.autoPhase = 'idle';
+    return;
+  }
+  if (this.doneGames.has(this.gameId)) return;
+
+  if (snap.finished) {
+    log(`Game ${this.gameId} finished, releasing takeover`);
+    this.doneGames.add(this.gameId);
+    this.takeover = false;
+    this.gameInProgress = false;
+    this.scheduleNext();
     return;
   }
 
@@ -783,6 +1127,8 @@ class Controller {
     if (chess.isGameOver()) {
       log(`Game ${this.gameId} over by rules, releasing takeover`);
       this.doneGames.add(this.gameId);
+      this.gameInProgress = false;
+      this.scheduleNext();
       return;
     }
     if (!piecesMatch(chess, snap.pieces)) {
@@ -799,6 +1145,9 @@ class Controller {
     // A created game that is still waiting for its opponent has no running
     // clock; never click the board before the game actually begins.
     if (!snap.started) {
+      // Keep the tab focused while waiting: if it drifted to the background the
+      // clock stalls and `started` would never flip (deadlock at ply 0).
+      await this.cdp.send('Page.bringToFront', {}, this.sid).catch(() => {});
       logThrottled('not-started', 5000, 'Game not started yet (clock not running), not moving');
       return;
     }
@@ -816,8 +1165,20 @@ class Controller {
     try {
       const fen = chess.fen();
       const ply = snap.sans.length;
-      const thinkMs = this.thinkTime(snap.ourClockSec);
-      const uci = await this.engine.requestMove(fen, thinkMs);
+      // Opening book: as White on move 1, push the queen's pawn two squares
+      // (1.d4, the Queen's Gambit) by default instead of searching. Set
+      // bridge.whiteFirstMove to "" to let the engine choose the first move.
+      let uci = null;
+      if (ply === 0 && snap.ourColor === 'w' && CONFIG.whiteFirstMove) {
+        const b = CONFIG.whiteFirstMove;
+        try {
+          const m = new Chess(fen).move({ from: b.slice(0, 2), to: b.slice(2, 4), promotion: b[4] || 'q' });
+          uci = b;
+          this.engine.lastInfo = null; // no search ran; don't report a stale eval
+          log(`Opening book: ${m.san} (${b})`);
+        } catch { /* illegal book move in this position: fall back to the engine */ }
+      }
+      if (!uci) uci = await this.engine.requestMove(fen, this.thinkTime(snap.ourClockSec));
       if (!uci || uci === '(none)') { log('Engine returned no move, skipping'); return; }
 
       // Discard the result if the position changed while searching (takeback,
@@ -848,6 +1209,11 @@ class Controller {
           if (sr.gameId !== this.gameId || sr.finished || sr.sans.length !== ply) {
             log('Position changed before retry, discarding this engine result');
             return;
+          }
+          // A promotion dialog that appeared after promoWaitMs would otherwise
+          // mask the board and swallow the retry clicks.
+          if (sr.promotion && uci.length > 4) {
+            await this.agent.choosePromotion(PROMO_ROLE[uci[4]] || 'queen', snap.ourColor === 'w' ? 'white' : 'black');
           }
         }
         try {
@@ -892,8 +1258,13 @@ class Controller {
       if (played) {
         this.reportEval(this.engine.lastInfo, snap.sans, ply);
       } else {
-        log(`⚠ Move failed after ${CONFIG.moveAttempts} attempts (expected ${mv.san}), stopping takeover of this game to avoid desync. Check the page, then refresh or start a new game.`);
+        log(`⚠ Move failed after ${CONFIG.moveAttempts} attempts (expected ${mv.san}), releasing this game to avoid desync.`);
         this.doneGames.add(this.gameId);
+        // Release fully so auto-start can move on and the stop hotkey can exit;
+        // leaving gameInProgress/takeover set would wedge both forever.
+        this.takeover = false;
+        this.gameInProgress = false;
+        this.scheduleNext();
       }
     } finally {
       this.thinking = false;
@@ -913,9 +1284,20 @@ class Controller {
   }
 
   async run() {
-    log('lc0 lichess takeover bridge started');
+    log('lc0 lichess bridge started');
     log(`Engine bridge: ${CONFIG.engineUrl} · think time: ${CONFIG.movetimeMs}ms per move (auto-shortened when a clock is present)`);
-    log('Scope: any already-started game (computer / human / BOT account); spectators and finished games excluded. Never starts games, resigns, or rematches.');
+    if (this.autoMode) {
+      const m = this.autoMode;
+      const desc = m.kind === 'ai'
+        ? `AI level ${m.level}, ${m.color}, ${m.time}${m.time === 'realtime' ? ' ' + m.preset : ''}`
+        : `online pool ${m.id}`;
+      log(`Auto-start ON: ${desc}; chains to the next game ${Math.round(CONFIG.nextGameDelayMs / 1000)}s after each finish. Never resigns or rematches.`);
+      if (m.kind === 'pool') log('Note: engine use in online human games on a normal account violates lichess fair-play rules; BOT accounts are the sanctioned option.');
+    } else {
+      log(CONFIG.autoStart
+        ? `Auto-start requested but autoMode "${CONFIG.autoMode}" is invalid; staying takeover-only. Use a pool id (e.g. "5+3") or "ai".`
+        : 'Auto-start OFF: takeover-only. Any already-started game (computer / human / BOT); spectators and finished games excluded.');
+    }
     ensureDaemon();
     this.engine.start();
     for (;;) {
@@ -924,10 +1306,15 @@ class Controller {
       } catch (e) {
         log('Poll error: ' + e.message);
         // A detached session (tab closed/navigated) must be re-attached.
+        if (this.cdp) { await this.cdp.detach(this.sid); await this.cdp.detach(this.lobbySid); }
         this.targetId = null; this.sid = null; this.agent = null;
+        this.lobbyTargetId = null; this.lobbySid = null; this.lobbyAgent = null;
+        this.autoBusy = false;
         if (this.cdp && !this.cdp.connected) this.cdp = null;
         await sleep(1000);
       }
+      // Stop hotkey: exit only once no live takeover game remains.
+      if (this.stopRequested && !this.gameInProgress) { shutdown(); return; }
       await sleep(CONFIG.pollMs);
     }
   }
@@ -943,8 +1330,26 @@ function shutdown() {
   log('Shutting down…');
   engine.stop();
   if (controller.cdp) controller.cdp.close();
+  // Restore the console from raw mode so the user's terminal keeps echo/Ctrl+C.
+  if (process.stdin.isTTY) {
+    try { process.stdin.setRawMode(false); } catch { /* not raw */ }
+    process.stdin.pause();
+  }
   setTimeout(() => process.exit(0), 300);
 }
 for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP', 'SIGBREAK']) process.on(sig, shutdown);
+
+// Stop hotkey (config bridge.stopKey, default "s"): finish the current game then
+// exit without starting a new one. Ctrl+C still stops immediately.
+if (process.stdin.isTTY) {
+  process.stdin.setRawMode(true);
+  process.stdin.resume();
+  process.stdin.on('data', (buf) => {
+    if (buf.toString() === CONFIG.stopKey) controller.requestStop();
+    else if (buf[0] === 3) shutdown(); // Ctrl+C
+  });
+} else {
+  log('No TTY: stop hotkey disabled; use Ctrl+C to stop.');
+}
 
 controller.run().catch((e) => { console.error('Fatal error:', e); process.exit(1); });
