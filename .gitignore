@@ -1,0 +1,10 @@
+# Dependencies
+node_modules/
+
+# Local Chrome test profile (cookies / login data - never commit)
+.chrome-test/
+
+# Logs & OS junk
+*.log
+Thumbs.db
+Desktop.ini

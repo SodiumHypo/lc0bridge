@@ -1,0 +1,524 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<link rel="icon" href="data:," />
+<title>Lc0 XL — Local GUI</title>
+<style>
+  :root {
+    --bg: #1b1d21;
+    --panel: #24272c;
+    --text: #e8e8e8;
+    --muted: #9aa0a6;
+    --accent: #4f9dff;
+    --light: #eeeed2;
+    --dark: #769656;
+    --sel: #f6f669;
+    --target: rgba(20, 85, 30, .45);
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font-family: "Segoe UI", system-ui, sans-serif;
+    display: flex; justify-content: center; align-items: flex-start;
+    min-height: 100vh; padding: 24px;
+  }
+  .layout { display: flex; gap: 24px; flex-wrap: wrap; justify-content: center; }
+  .board-wrap { width: min(78vw, 640px); }
+  .board {
+    width: 100%; aspect-ratio: 1 / 1;
+    display: grid; grid-template-columns: repeat(8, 1fr);
+    border-radius: 8px; overflow: hidden;
+    box-shadow: 0 10px 40px rgba(0,0,0,.45);
+    user-select: none;
+  }
+  .sq {
+    position: relative; display: flex; align-items: center; justify-content: center;
+    font-size: min(9vw, 64px); line-height: 1; cursor: pointer;
+    touch-action: none;
+  }
+  .sq.light { background: var(--light); }
+  .sq.dark  { background: var(--dark); }
+  .sq.sel   { box-shadow: inset 0 0 0 4px var(--sel); }
+  .sq.target::after {
+    content: ""; position: absolute; width: 28%; height: 28%;
+    border-radius: 50%; background: var(--target);
+  }
+  .sq.last::before {
+    content: ""; position: absolute; inset: 0;
+    background: rgba(246, 246, 105, .25);
+  }
+  .piece { position: relative; z-index: 2; }
+  .piece.w { color: #fff; text-shadow: 0 0 2px #000, 0 1px 2px #000; }
+  .piece.b { color: #111; text-shadow: 0 0 1px #fff, 0 1px 2px rgba(255,255,255,.5); }
+  .panel {
+    width: 320px; background: var(--panel); border-radius: 10px; padding: 18px;
+    display: flex; flex-direction: column; gap: 14px;
+    box-shadow: 0 10px 40px rgba(0,0,0,.35);
+  }
+  h1 { font-size: 17px; margin: 0; font-weight: 600; }
+  .sub { color: var(--muted); font-size: 12px; word-break: break-all; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; }
+  button, select {
+    background: #31353b; color: var(--text); border: 1px solid #3d424a;
+    border-radius: 6px; padding: 8px 12px; font-size: 13px; cursor: pointer;
+  }
+  button:hover { border-color: var(--accent); }
+  button.primary { background: var(--accent); color: #07121f; border-color: var(--accent); font-weight: 600; }
+  .status {
+    font-size: 13px; padding: 10px; border-radius: 6px; background: #1d2025;
+    border-left: 3px solid var(--accent); min-height: 40px;
+  }
+  .stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+  .stat { background: #1d2025; border-radius: 6px; padding: 8px; text-align: center; }
+  .stat .k { font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: .5px; }
+  .stat .v { font-size: 15px; font-weight: 600; margin-top: 2px; }
+  .moves {
+    flex: 1; min-height: 140px; max-height: 260px; overflow-y: auto;
+    background: #1d2025; border-radius: 6px; padding: 10px; font-size: 13px;
+    line-height: 1.7; font-family: Consolas, monospace; color: #cfd3d8;
+  }
+  .moves span.n { color: var(--muted); }
+  .log { font-size: 11px; color: var(--muted); max-height: 90px; overflow-y: auto; font-family: Consolas, monospace; }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #d9534f; margin-right: 6px; }
+  .dot.ok { background: #4caf50; }
+  @media (max-width: 1000px) { .panel { width: min(78vw, 640px); } }
+</style>
+</head>
+<body>
+<div class="layout">
+  <div class="board-wrap">
+    <div id="board" class="board"></div>
+  </div>
+
+  <div class="panel">
+    <div>
+      <h1>Lc0 XL · RTX 5060</h1>
+      <div class="sub">BT4-1024x15 · cuda-fp16 · Docker/WSL2</div>
+    </div>
+
+    <div class="status"><span id="engineDot" class="dot"></span><span id="status">connecting...</span></div>
+
+    <div class="stats">
+      <div class="stat"><div class="k">Depth</div><div class="v" id="depth">–</div></div>
+      <div class="stat"><div class="k">NPS</div><div class="v" id="nps">–</div></div>
+      <div class="stat"><div class="k">Eval</div><div class="v" id="eval">–</div></div>
+    </div>
+
+    <div class="row">
+      <button class="primary" id="newWhite">新局（执白）</button>
+      <button id="newBlack">执黑</button>
+      <button id="undo">悔棋</button>
+      <button id="stop">停止</button>
+      <button id="restart">重启引擎</button>
+    </div>
+
+    <div class="row">
+      <label class="sub" style="align-self:center">每步时间</label>
+      <select id="movetime">
+        <option value="1000">1s</option>
+        <option value="2000">2s</option>
+        <option value="3000" selected>3s</option>
+        <option value="5000">5s</option>
+        <option value="10000">10s</option>
+      </select>
+      <button id="flip">翻转棋盘</button>
+    </div>
+
+    <div class="moves" id="moves"></div>
+    <div class="log" id="log"></div>
+  </div>
+</div>
+
+<script type="module">
+import { Chess } from './chess.js';
+
+const PIECES = {
+  wp: '♙', wn: '♘', wb: '♗', wr: '♖', wq: '♕', wk: '♔',
+  bp: '♟', bn: '♞', bb: '♝', br: '♜', bq: '♛', bk: '♚',
+};
+const FILES = 'abcdefgh';
+
+const game = new Chess();
+let playerColor = 'w';
+let flipped = false;
+let selected = null;
+let legalTargets = [];
+let engineThinking = false;
+let engineReady = false;
+let ignoreBestmove = false;
+let engineAwaiting = false;
+let lastMove = null;
+let pendingNewGame = null;
+let ws = null;
+
+const $ = (id) => document.getElementById(id);
+const boardEl = $('board');
+const statusEl = $('status');
+const dotEl = $('engineDot');
+const movesEl = $('moves');
+const logEl = $('log');
+
+function send(cmd) {
+  if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: 'cmd', cmd }));
+}
+
+function setStatus(text, ready) {
+  statusEl.textContent = text;
+  dotEl.classList.toggle('ok', !!ready);
+}
+
+function logLine(line) {
+  const div = document.createElement('div');
+  div.textContent = line;
+  logEl.appendChild(div);
+  logEl.scrollTop = logEl.scrollHeight;
+  while (logEl.childElementCount > 60) logEl.removeChild(logEl.firstChild);
+}
+
+function render() {
+  boardEl.innerHTML = '';
+  const order = [...Array(8).keys()];
+  const rows = flipped ? order.slice().reverse() : order;
+  const files = flipped ? order.slice().reverse() : order;
+  const board = game.board(); // board[0] is rank 8
+
+  for (const r of rows) {
+    for (const f of files) {
+      const sq = document.createElement('div');
+      const fileChar = FILES[f];
+      const rankChar = String(8 - r);
+      const sqName = fileChar + rankChar;
+      sq.className = 'sq ' + ((r + f) % 2 === 0 ? 'light' : 'dark');
+      sq.dataset.sq = sqName;
+
+      if (selected === sqName) sq.classList.add('sel');
+      if (legalTargets.includes(sqName)) sq.classList.add('target');
+      if (lastMove && (lastMove.from === sqName || lastMove.to === sqName)) sq.classList.add('last');
+
+      const piece = board[r][f];
+      if (piece) {
+        const span = document.createElement('span');
+        span.className = 'piece ' + piece.color;
+        span.textContent = PIECES[piece.color + piece.type];
+        sq.appendChild(span);
+      }
+      sq.addEventListener('pointerdown', (e) => {
+        e.preventDefault();
+        pressedFrom = null;
+        dragging = false;
+        const p = game.get(sqName);
+        if (canInteract() && p && p.color === playerColor) pressedFrom = sqName;
+        onSquareClick(sqName);
+      });
+      boardEl.appendChild(sq);
+    }
+  }
+}
+
+function renderMoves() {
+  const hist = game.history();
+  let html = '';
+  for (let i = 0; i < hist.length; i += 2) {
+    const n = i / 2 + 1;
+    const white = hist[i];
+    const black = hist[i + 1] || '';
+    html += `<span class="n">${n}.</span> ${white} ${black}<br>`;
+  }
+  movesEl.innerHTML = html || '<span class="n">等待开局…</span>';
+  movesEl.scrollTop = movesEl.scrollHeight;
+}
+
+function gameOverText() {
+  if (game.isCheckmate()) return `将死 — ${game.turn() === 'w' ? '黑方胜' : '白方胜'}`;
+  if (game.isDraw()) return '和棋';
+  if (game.isStalemate()) return '逼和';
+  if (game.isThreefoldRepetition()) return '三次重复局面和棋';
+  if (game.isInsufficientMaterial()) return '子力不足和棋';
+  if (game.isGameOver()) return '对局结束';
+  return null;
+}
+
+function refreshAfterMove() {
+  lastMove = game.history({ verbose: true }).at(-1) || null;
+  selected = null;
+  legalTargets = [];
+  render();
+  renderMoves();
+  const over = gameOverText();
+  if (over) {
+    setStatus(over, engineReady);
+    return true;
+  }
+  return false;
+}
+
+function requestEngineMove() {
+  if (game.isGameOver()) return;
+  if (!engineReady) {
+    engineAwaiting = true;
+    engineThinking = false;
+    setStatus('引擎未就绪，恢复后自动应答', false);
+    return;
+  }
+  engineThinking = true;
+  engineAwaiting = false;
+  ignoreBestmove = false;
+  setStatus('引擎思考中…', engineReady);
+  send('position fen ' + game.fen());
+  send('go movetime ' + $('movetime').value);
+}
+
+// Undo back to the player's turn: drop the engine's reply if it already moved,
+// then drop the player's own last move. Stops any running search first.
+function undoMove() {
+  if (!game.history().length) return;
+
+  if (engineThinking) {
+    send('stop');
+    ignoreBestmove = true;
+  }
+  engineThinking = false;
+  pendingNewGame = null;
+
+  if (game.turn() === playerColor) game.undo();                 // engine's reply
+  if (game.turn() !== playerColor && game.history().length) game.undo(); // player's move
+
+  selected = null;
+  legalTargets = [];
+  lastMove = game.history({ verbose: true }).at(-1) || null;
+  render();
+  renderMoves();
+
+  if (game.turn() !== playerColor && !game.isGameOver()) {
+    setStatus('已悔棋 — 引擎重新思考', engineReady);
+    requestEngineMove();
+  } else {
+    setStatus('已悔棋 — 轮到你走棋', engineReady);
+  }
+}
+
+let pressedFrom = null;
+let dragging = false;
+
+function canInteract() {
+  return !game.isGameOver() && !engineThinking && game.turn() === playerColor;
+}
+
+function legalTargetsFrom(sqName) {
+  return game.moves({ square: sqName, verbose: true }).map((m) => m.to);
+}
+
+// Dropping/clicking the king onto its own rook also castles, as most GUIs allow.
+function castleTarget(from, to) {
+  const king = game.get(from);
+  const rook = game.get(to);
+  if (!king || king.type !== 'k' || !rook || rook.type !== 'r' || rook.color !== king.color) return null;
+  const castle = game.moves({ square: from, verbose: true }).find(
+    (m) => (m.flags.includes('k') || m.flags.includes('q'))
+      && to[0] === (m.flags.includes('k') ? 'h' : 'a')
+      && to[1] === from[1]
+  );
+  return castle ? castle.to : null;
+}
+
+function makeMove(from, to) {
+  const target = castleTarget(from, to) || to;
+  const move = game.move({ from, to: target, promotion: 'q' });
+  if (!move) return false;
+  if (refreshAfterMove()) return true;
+  requestEngineMove();
+  return true;
+}
+
+function onSquareClick(sqName) {
+  if (!canInteract()) return;
+
+  const piece = game.get(sqName);
+  if (selected && legalTargets.includes(sqName)) {
+    makeMove(selected, sqName);
+    return;
+  }
+  if (selected && castleTarget(selected, sqName)) {
+    makeMove(selected, sqName);
+    return;
+  }
+  if (piece && piece.color === playerColor) {
+    selected = sqName;
+    legalTargets = legalTargetsFrom(sqName);
+  } else {
+    selected = null;
+    legalTargets = [];
+  }
+  render();
+}
+
+// Drag & drop: pointerdown starts on the piece, pointerup on the target completes it.
+boardEl.addEventListener('pointermove', () => {
+  if (pressedFrom) dragging = true;
+});
+
+boardEl.addEventListener('pointerup', (e) => {
+  if (!pressedFrom) return;
+  const from = pressedFrom;
+  pressedFrom = null;
+  if (!dragging) return;
+  dragging = false;
+  const el = document.elementFromPoint(e.clientX, e.clientY);
+  const sqEl = el && el.closest ? el.closest('.sq') : null;
+  const to = sqEl ? sqEl.dataset.sq : null;
+  if (to && to !== from) makeMove(from, to);
+});
+
+function newGame(color) {
+  playerColor = color;
+  flipped = color === 'b';
+  selected = null;
+  legalTargets = [];
+  lastMove = null;
+  engineThinking = false;
+  game.reset();
+  render();
+  renderMoves();
+  setStatus('新对局 — ' + (color === 'w' ? '你执白' : '你执黑'), engineReady);
+  send('ucinewgame');
+  send('isready');
+  if (color === 'b') pendingNewGame = true;
+}
+
+function applyEngineMove(uci) {
+  engineThinking = false;
+  if (!uci || uci === '(none)') {
+    const over = gameOverText() || '引擎无着';
+    setStatus(over, engineReady);
+    return;
+  }
+  const from = uci.slice(0, 2);
+  const to = uci.slice(2, 4);
+  const promo = uci.length > 4 ? uci[4] : undefined;
+  const move = game.move({ from, to, promotion: promo || 'q' });
+  if (!move) {
+    logLine('engine move rejected: ' + uci);
+    return;
+  }
+  if (refreshAfterMove()) return;
+  setStatus('轮到你走棋', engineReady);
+}
+
+function parseInfo(line) {
+  const depth = /depth (\d+)/.exec(line);
+  const nps = /nps (\d+)/.exec(line);
+  const cp = /score cp (-?\d+)/.exec(line);
+  const mate = /score mate (-?\d+)/.exec(line);
+  if (depth) $('depth').textContent = depth[1];
+  if (nps) $('nps').textContent = Number(nps[1]).toLocaleString();
+  if (mate) $('eval').textContent = 'M' + mate[1];
+  else if (cp) $('eval').textContent = (Number(cp[1]) / 100).toFixed(2);
+}
+
+function connect() {
+  ws = new WebSocket(`ws://${location.host}`);
+  ws.onopen = () => {
+    setStatus('engine starting…', false);
+    send('uci');
+  };
+  ws.onclose = () => {
+    setStatus('连接断开，正在重连…', false);
+    engineReady = false;
+    setTimeout(connect, 1500);
+  };
+  ws.onmessage = (ev) => {
+    let msg;
+    try { msg = JSON.parse(ev.data); } catch { return; }
+    if (msg.type === 'status') {
+      if (msg.dead) {
+        engineReady = false;
+        engineThinking = false; // never leave the board locked
+        if (game.turn() !== playerColor && !game.isGameOver()) engineAwaiting = true;
+      }
+      setStatus(msg.text, engineReady);
+      logLine(msg.text);
+      return;
+    }
+    if (msg.type === 'reset') {
+      // The backend spawned a brand-new engine process; redo the UCI handshake.
+      engineReady = false;
+      if (game.turn() !== playerColor && !game.isGameOver()) engineAwaiting = true;
+      setStatus('引擎重启中…', false);
+      send('uci');
+      return;
+    }
+    if (msg.type === 'log') {
+      logLine(msg.line);
+      if (/CUDA Runtime|GPU compute capability|Network format/.test(msg.line)) {
+        setStatus(msg.line, engineReady);
+      }
+      return;
+    }
+    if (msg.type !== 'engine') return;
+    const line = msg.line;
+
+    if (line === 'uciok') {
+      send('setoption name Threads value 2');
+      send('isready');
+      return;
+    }
+    if (line === 'readyok') {
+      engineReady = true;
+      setStatus('引擎就绪', true);
+      if (pendingNewGame) {
+        pendingNewGame = null;
+        // Playing black: the engine holds white and must open the game.
+        if (game.turn() !== playerColor) requestEngineMove();
+        else setStatus('新对局 — 轮到你走棋', true);
+      } else if (engineAwaiting && game.turn() !== playerColor && !game.isGameOver()) {
+        requestEngineMove();
+      }
+      return;
+    }
+    if (line.startsWith('info ')) { parseInfo(line); return; }
+    if (line.startsWith('bestmove')) {
+      if (ignoreBestmove) { ignoreBestmove = false; return; } // reply to a stopped search
+      const uci = line.split(/\s+/)[1];
+      applyEngineMove(uci);
+    }
+  };
+}
+
+$('newWhite').onclick = () => newGame('w');
+$('newBlack').onclick = () => newGame('b');
+$('undo').onclick = () => undoMove();
+$('stop').onclick = () => {
+  if (engineThinking) { ignoreBestmove = true; engineThinking = false; }
+  send('stop');
+  setStatus('已停止 — 轮到你走棋', engineReady);
+};
+$('flip').onclick = () => { flipped = !flipped; render(); };
+$('restart').onclick = () => {
+  engineReady = false;
+  setStatus('重启引擎…', false);
+  if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: 'restart' }));
+};
+
+// Debug/test hook: lets automated checks drive the board directly.
+window.__lc0gui = {
+  game,
+  onSquareClick,
+  loadFen(fen) {
+    game.load(fen);
+    selected = null;
+    legalTargets = [];
+    lastMove = null;
+    engineThinking = false;
+    pendingNewGame = null;
+    render();
+  },
+};
+
+render();
+renderMoves();
+connect();
+</script>
+</body>
+</html>

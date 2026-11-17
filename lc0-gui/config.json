@@ -1,0 +1,30 @@
+{
+  "engine": {
+    "distro": "Ubuntu-26.10",
+    "image": "nvidia/cuda:12.8.0-cudnn-devel-ubuntu22.04",
+    "hostMount": "/home/sodiumhypo/lc0-deploy",
+    "containerName": "lc0-uci",
+    "binary": "/work/bin/lc0",
+    "weightsDir": "/work/weights",
+    "weightsFile": "BT4-1024x15x32h-swa-6147500-policytune-332.pb.gz",
+    "backend": "cuda-fp16",
+    "port": 8642
+  },
+  "bridge": {
+    "engineUrl": "ws://127.0.0.1:8642",
+    "portFile": "",
+    "movetimeMs": 3000,
+    "threads": 2,
+    "pollMs": 400,
+    "clickGapMs": 120,
+    "verifyTimeoutMs": 6000,
+    "promoWaitMs": 2000,
+    "engineWatchdogMs": 45000,
+    "clockSafetyMs": 1200,
+    "minMoveTimeMs": 200,
+    "moveAttempts": 3,
+    "retryGapMs": 400,
+    "debugPort": 0,
+    "daemonCli": "chrome-auto-connect-win"
+  }
+}
