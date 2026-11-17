@@ -431,6 +431,37 @@ class PageAgent {
 // Engine client: drives the UCI handshake over the server.js WS protocol.
 // ---------------------------------------------------------------------------
 
+// Parse a UCI `info` line into the fields we display/track. lc0 emits
+// `score cp` (logistic-derived from Q) plus native `wdl` per-mille, both from
+// the side-to-move perspective; `score mate N` appears near forced mates.
+function parseInfo(line) {
+  const t = line.split(/\s+/);
+  const num = (key) => { const i = t.indexOf(key); return i >= 0 ? Number(t[i + 1]) : null; };
+  const info = { depth: num('depth'), nps: num('nps'), cp: null, mate: null, wdl: null, pv: [] };
+  const si = t.indexOf('score');
+  if (si >= 0) {
+    if (t[si + 1] === 'cp') info.cp = Number(t[si + 2]);
+    else if (t[si + 1] === 'mate') info.mate = Number(t[si + 2]);
+  }
+  const wi = t.indexOf('wdl');
+  if (wi >= 0) info.wdl = [Number(t[wi + 1]), Number(t[wi + 2]), Number(t[wi + 3])];
+  const pi = t.indexOf('pv');
+  if (pi >= 0) info.pv = t.slice(pi + 1, pi + 4);
+  return info;
+}
+
+// lichess win% model (cp clamped to ±1000 like lichess does).
+function winPercent(cp) {
+  const c = Math.max(-1000, Math.min(1000, cp));
+  return 50 + 50 * (2 / (1 + Math.exp(-0.00368208 * c)) - 1);
+}
+
+// lichess per-move accuracy from the win% a move cost its own side.
+function moveAccuracy(winLoss) {
+  const acc = 103.1668 * Math.exp(-0.04354 * Math.max(0, winLoss)) - 3.1669;
+  return Math.max(0, Math.min(100, acc));
+}
+
 class EngineClient {
   constructor(url) {
     this.url = url;
@@ -439,6 +470,7 @@ class EngineClient {
     this.pending = null;       // { resolve, timer }
     this.ignoreBestmove = false;
     this.stopped = false;
+    this.lastInfo = null;      // final `info` line of the current/last search
   }
 
   start() { this.stopped = false; this._connect(); }
@@ -482,6 +514,7 @@ class EngineClient {
       // Backend spawned a fresh engine process: redo the handshake.
       this.ready = false;
       this.ignoreBestmove = false;
+      this.lastInfo = null;
       this._resolvePending(null);
       log('Engine process reset, re-handshaking');
       this._send('uci');
@@ -497,6 +530,10 @@ class EngineClient {
     if (line === 'readyok') {
       if (!this.ready) log('Engine ready');
       this.ready = true;
+      return;
+    }
+    if (line.startsWith('info ') && line.includes(' score ')) {
+      this.lastInfo = parseInfo(line); // last one before bestmove wins
       return;
     }
     if (line.startsWith('bestmove')) {
@@ -526,6 +563,7 @@ class EngineClient {
         log('Engine search timed out, sent stop');
       }, movetimeMs + CONFIG.engineWatchdogMs);
       this.pending = { resolve, timer };
+      this.lastInfo = null; // fresh stats per search
       this._send('position fen ' + fen);
       this._send('go movetime ' + movetimeMs);
     });
@@ -585,6 +623,8 @@ class Controller {
     this.doneGames = new Set();
     this.warned = new Set();
     this.frontedGame = null;
+    this.evalChain = null;          // { win, ply, gameId } of our previous search
+    this.oppAcc = { sum: 0, n: 0 }; // running opponent-accuracy estimate
   }
 
   warnOnce(key, ...args) {
@@ -599,6 +639,35 @@ class Controller {
     if (clockSec == null) return CONFIG.movetimeMs;
     const budget = clockSec * 1000 - CONFIG.clockSafetyMs;
     return Math.max(CONFIG.minMoveTimeMs, Math.min(CONFIG.movetimeMs, budget));
+  }
+
+  // Log the search evaluation and update the opponent-accuracy estimate.
+  // Searches always run on our turn, so cp/WDL are already our perspective.
+  // Between two consecutive searches exactly two plies pass (our engine-best
+  // move + the opponent's reply). Our move is assumed eval-neutral, so any
+  // RISE in our win% is the opponent's loss (their win% = 100 - ours); a drop
+  // means they played well. Takebacks/resyncs break the ply+2 chain and skip
+  // the sample.
+  reportEval(info, sans, ply) {
+    if (!info || (info.cp == null && info.mate == null)) return;
+    const cp = info.cp != null ? info.cp : 0;
+    // A forced mate is a certain result, outside the cp->win% logistic model.
+    const win = info.mate != null ? (info.mate > 0 ? 100 : 0) : winPercent(cp);
+    const scoreText = info.mate != null
+      ? (info.mate > 0 ? 'M' : '-M') + Math.abs(info.mate)
+      : (cp >= 0 ? '+' : '') + (cp / 100).toFixed(2);
+    const parts = ['eval ' + scoreText];
+    if (info.wdl) parts.push(`W ${Math.round(info.wdl[0] / 10)}% D ${Math.round(info.wdl[1] / 10)}% L ${Math.round(info.wdl[2] / 10)}%`);
+    if (info.depth != null) parts.push('d' + info.depth);
+    if (info.nps) parts.push(Math.round(info.nps / 1000) + 'k nps');
+    if (this.evalChain && this.evalChain.gameId === this.gameId && this.evalChain.ply + 2 === ply) {
+      const acc = moveAccuracy(win - this.evalChain.win);
+      this.oppAcc.sum += acc;
+      this.oppAcc.n++;
+      parts.push(`opp ${sans[ply - 1] || '?'} acc ${acc.toFixed(1)}% (avg ${(this.oppAcc.sum / this.oppAcc.n).toFixed(1)}%, ${this.oppAcc.n} moves)`);
+    }
+    this.evalChain = { win, ply, gameId: this.gameId };
+    log('  ' + parts.join(' | '));
   }
 
   async ensureCdp() {
@@ -654,6 +723,8 @@ class Controller {
   if (snap.gameId !== this.gameId) {
     this.gameId = snap.gameId;
     this.warned.clear();
+    this.evalChain = null;
+    this.oppAcc = { sum: 0, n: 0 };
 
     const spectator     = !snap.isPlayer;
     const humanVsHuman  = !snap.opponentIsAi && !snap.ourIsBot; // online human game
@@ -818,7 +889,9 @@ class Controller {
         }
         log(`Move did not register (attempt ${attempt}/${CONFIG.moveAttempts})` + (attempt < CONFIG.moveAttempts ? ', retrying…' : ''));
       }
-      if (!played) {
+      if (played) {
+        this.reportEval(this.engine.lastInfo, snap.sans, ply);
+      } else {
         log(`⚠ Move failed after ${CONFIG.moveAttempts} attempts (expected ${mv.san}), stopping takeover of this game to avoid desync. Check the page, then refresh or start a new game.`);
         this.doneGames.add(this.gameId);
       }
