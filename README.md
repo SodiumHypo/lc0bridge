@@ -1,21 +1,34 @@
-# lc0xl
+# lc0bridge
 
-Local lc0 (BT4 network) inference on Windows via WSL2/Docker, with a browser
-GUI and a lichess.org takeover bridge.
+Local **lc0** inference on Windows (WSL2 + Docker + NVIDIA GPU) with a browser
+board GUI and an autonomous **lichess.org takeover bridge**: it can create games,
+play them, chain to the next, claim wins when opponents abandon, and stop
+gracefully on a hotkey.
 
-Everything lives in [`lc0-gui/`](lc0-gui/README.md) — see its README for the
-full protocol, usage and troubleshooting docs.
+The engine seam is **UCI over a local WebSocket**, so other UCI engines — or
+non-UCI models via a small adapter — can drive the same front-ends.
+
+**Full documentation** (features, config reference, protocols, reliability,
+extending to other engines/models, troubleshooting): [`lc0-gui/README.md`](lc0-gui/README.md).
 
 ## Quick start
 
 ```bat
 cd lc0-gui
 npm install
-notepad config.json   :: machine-specific: WSL distro, mounts, weights, ports
+copy config.example.json config.json
+notepad config.json   :: machine-specific: WSL distro, mounts, weights, backend
 start-engine.cmd      :: backend (WSL2 + Docker + CUDA lc0)
 start-gui.cmd         :: local board GUI
-start-lichess.cmd     :: lichess takeover bridge (Chrome remote debugging required)
+start-lichess.cmd     :: lichess bridge (Chrome remote debugging required)
 ```
 
-`diag/` holds read-only diagnostic scripts (e.g. `diag-sans.js` attaches to
-the live lichess tab via CDP and reports move-list extraction problems).
+`config.json` is git-ignored; `config.example.json` is the machine-neutral
+template. `diag/` holds read-only CDP diagnostics (e.g. `diag-sans.js` reports
+move-list extraction problems on a live tab).
+
+Validated over **95 consecutive automated games** with no desync or crash.
+
+> **Fair play:** engine assistance in online human games on a normal account
+> violates lichess policy. Use a **BOT-flagged account** for online engine play;
+> computer games and the local GUI are unaffected.
